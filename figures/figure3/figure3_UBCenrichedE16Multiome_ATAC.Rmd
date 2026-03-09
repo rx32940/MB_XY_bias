@@ -1,0 +1,2434 @@
+---
+title: "process_SJMB12_samples"
+output: html_document
+date: "2025-10-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# setup
+```{r}
+.libPaths(file.path(Sys.getenv("HOME"),"R/rstudio/4.3.1"))
+library(ArchR, lib.loc = file.path(Sys.getenv("HOME"),"R/rstudio/4.3.1")) # seurat 4
+library(dplyr)
+# known seed for replication
+set.seed(1)
+
+
+workDir <- file.path(Sys.getenv("COMMONR"),"sex_bias")
+inpath <- file.path(workDir, "scripts/UBCenrichedE16Multiome/snATAC_mutiome") # dir with original arrow files
+outpath <- file.path(workDir, "processed/mouse/multiome/snATAC/UBCenrichedE16Multiome")
+
+set.seed(1)
+
+cat("# Add ArchR params\n")
+addArchRThreads(threads = 1) 
+
+
+```
+
+# build mm39 genome
+```{r}
+
+
+library(BSgenome.Mmusculus.UCSC.mm39)
+library(org.Mm.eg.db)
+library(GenomicFeatures)
+library(GenomicRanges)
+
+gtf_path <- file.path(Sys.getenv("HOME"),"refdata-cellranger-arc-GRCm39-2024-A/genes/genes.gtf.gz")
+
+TxDb.Mmusculus <- makeTxDbFromGFF(
+    file = gtf_path,
+    format = "gtf",
+    organism = "Mus musculus"
+)
+
+geneAnno <- createGeneAnnotation(
+    TxDb = TxDb.Mmusculus,  
+    OrgDb = org.Mm.eg.db
+)
+
+# blacklist downloaded from: https://dozmorovlab.github.io/excluderanges/#excluderanges-genomic-ranges-of-problematic-genomic-regions
+bed <- read.table(file.path(Sys.getenv("HOME"),"references/mm39.excluderanges.bed"), 
+                  sep = "\t", 
+                  header = FALSE,
+                  colClasses = c("character", "integer", "integer", "integer", "character", "character"))
+
+blacklist <- GRanges(
+    seqnames = bed[,1],
+    ranges = IRanges(start = bed[,2] + 1, end = bed[,3])
+)
+
+genomeAnno <- createGenomeAnnotation(
+    genome = BSgenome.Mmusculus.UCSC.mm39,
+    blacklist = blacklist
+)
+
+saveRDS(geneAnno, file.path(Sys.getenv("HOME"),"references/Mus_musculus/mm39_ArchR/mm39_geneAnnotation.rds"))
+saveRDS(genomeAnno, file.path(Sys.getenv("HOME"),"references/Mus_musculus/mm39_ArchR/mm39_genomeAnnotation.rds"))
+
+```
+
+
+# Create ArchR project
+```{r}
+
+
+script_content <- '
+library(ArchR)
+library(dplyr)
+library(rhdf5)
+
+cat("# Set seed for replication\n")
+set.seed(1)
+
+cat("# Add ArchR params\n")
+addArchRThreads(threads = 6) 
+
+geneAnno <- readRDS(file.path(Sys.getenv("HOME"),"references/Mus_musculus/mm39_ArchR/mm39_geneAnnotation.rds"))
+genomeAnno <- readRDS(file.path(Sys.getenv("HOME"),"references/Mus_musculus/mm39_ArchR/mm39_genomeAnnotation.rds"))
+
+# Define paths
+workDir <- file.path(Sys.getenv("COMMONR"),"sex_bias")
+common_dir <- file.path(workDir, "processed/mouse/multiome", "cellranger-arc") # mapped files (fragment files)
+inpath <- file.path(workDir, "scripts/UBCenrichedE16Multiome/snATAC_mutiome") # dir with original arrow files
+outpath <- file.path(workDir, "processed/mouse/multiome/snATAC/UBCenrichedE16Multiome")
+
+# Create output directories if they dont exist
+dir.create(outpath, showWarnings = FALSE, recursive = TRUE)
+dir.create(inpath, showWarnings = FALSE, recursive = TRUE)
+
+# Sample information
+unique_paths <- c(
+  "female-e16",
+  "male-e16"
+)
+cat(paste0("# Total samples: ", length(unique_paths), "\n"))
+
+sample_names <- c(  "female-e16",
+  "male-e16")
+cat(paste0("# Total sample names: ", length(sample_names), "\n"))
+
+# Full paths to sample directories
+sample_dirs <- file.path(common_dir, unique_paths)
+names(sample_dirs) <- sample_names
+
+
+# Function to get barcodes from filtered h5 matrix
+getValidBarcodesFromFilteredH5 <- function(dir, sample_name) {
+  h5_file <- file.path(dir, "outs/filtered_feature_bc_matrix.h5")
+  
+  if (!file.exists(h5_file)) {
+    cat(paste0("Warning: H5 file not found at ", h5_file, "\n"))
+    return(NULL)
+  }
+  
+  barcodes <- h5read(h5_file, "matrix/barcodes")
+  
+  # Store barcodes in a named list
+  result <- list(barcodes = barcodes)
+  names(result) <- sample_name
+  return(result)
+}
+
+# Loop through each sample and create Arrow files with error handling
+for (i in seq_along(sample_dirs)) {
+  
+  sample <- names(sample_dirs)[i]
+  sample_dir <- sample_dirs[i]
+  
+  cat(paste0("\n# Processing sample: ", sample, " (", i, "/", length(sample_dirs), ")\n"))
+  
+  # Get fragment file
+  fragment_file <- file.path(sample_dir, "outs/atac_fragments.tsv.gz")
+  
+  if (!file.exists(fragment_file)) {
+    cat(paste0("Warning: Fragment file not found for ", sample, ". Skipping.\n"))
+    next
+  }
+  
+  inputFiles <- fragment_file
+  names(inputFiles) <- sample
+  
+  cat(paste0("# Fragment file: ", fragment_file, "\n"))
+  
+  cat("# Get cells with Cell Ranger validated barcodes\n")
+  CellRangerValidatedBarcodes <- getValidBarcodesFromFilteredH5(sample_dir, sample)
+  
+  if (is.null(CellRangerValidatedBarcodes)) {
+    cat(paste0("Warning: Could not get validated barcodes for ", sample, ". Skipping.\n"))
+    next
+  }
+  
+  validateNum <- length(CellRangerValidatedBarcodes[[sample]])
+  cat(paste0("# Keeping only ", validateNum, " cells validated by Cell Ranger for ", sample, "\n"))
+  
+  # Try-Catch block for createArrowFiles
+  tryCatch({
+    ArrowFile <- createArrowFiles(
+      inputFiles = inputFiles,
+      sampleNames = sample,
+      minTSS = 0,
+      minFrags = 0,  # Filter later
+      addTileMat = TRUE,
+      addGeneScoreMat = TRUE,
+            geneAnnotation = geneAnno,
+    genomeAnnotation = genomeAnno,
+      validBarcodes = CellRangerValidatedBarcodes,
+      force = TRUE
+    )
+    cat(paste0("# Successfully created Arrow file for ", sample, "\n"))
+  }, error = function(e) {
+    cat(paste0("Error creating Arrow file for ", sample, ": ", e$message, "\n"))
+  })
+  
+} # End of the loop
+
+cat("\n# Processing completed for all samples.\n")
+
+# Get all Arrow files
+ArrowFiles <- list.files(inpath, pattern = ".arrow$", full.names = TRUE)
+cat(paste0("# Number of arrow files: ", length(ArrowFiles), "\n"))
+
+# Create ArchR Project
+cat("# Creating ArchR Project\n")
+projPat1 <- ArchRProject(
+  ArrowFiles = ArrowFiles,
+  outputDirectory = inpath,
+      geneAnnotation = geneAnno,
+    genomeAnnotation = genomeAnno,
+  copyArrows = TRUE # Recommended so that you have an original copy
+)
+
+cat(paste0("Memory Size = ", round(object.size(projPat1) / 10^6, 3), " MB\n"))
+
+cat("# Saving ArchR project\n")
+saveArchRProject(ArchRProj = projPat1, outputDirectory = outpath, load = FALSE)
+
+cat("# Project saved successfully!\n")
+'
+
+
+# Write to the correct location with correct filename
+writeLines(script_content, con = file.path(inpath, "save_arrowFiles_to_RDS.R"))
+file.path(inpath, "save_arrowFiles_to_RDS.R")
+```
+
+```{bash}
+
+cd $COMMONR/sex_bias/scripts/UBCenrichedE16Multiome/snATAC_mutiome
+
+bsub -q priority -P save_arrowFiles_to_RDS -R "rusage[mem=30GB]" -R "span[hosts=1]" -n 6 -o "log/inferDoublets.%J.out" -e "log/inferDoublets.%J.out" "source activate R_conda_env_4.0.5; Rscript save_arrowFiles_to_RDS.R"
+```
+
+# process snRNA from matched samples
+```{r}
+
+
+library(anndata)
+
+rna_h5ad <- anndata::read_h5ad(file.path(Sys.getenv("COMMONR"),'sex_bias/processed/mouse/multiome/writes/UBCenrichedE16Multiome_scVI.h5ad'))
+
+counts_t <- Matrix::t(rna_h5ad[['layers']][['counts']])
+rna_obj <- Seurat::CreateSeuratObject(
+  counts = counts_t,
+  meta.data = rna_h5ad[['obs']],
+  project = "SJMB12_RNA",
+  min.cells = 0,
+  min.features = 0
+)
+
+# Set the data slot
+log1p_norm <- Matrix::t(rna_h5ad[['layers']][['log1p_norm']])
+rna_obj <- Seurat::SetAssayData(
+  object = rna_obj,
+  slot = "data",
+  new.data = log1p_norm
+)
+rna_obj@meta.data
+umap_embedding <- rna_h5ad[['obsm']][['X_umap']]
+colnames(umap_embedding) <- paste0("UMAP_", 1:ncol(umap_embedding))
+rownames(umap_embedding) <- rownames(rna_h5ad[['obs']])
+
+rna_obj[["umap"]] <- Seurat::CreateDimReducObject(
+  embeddings = umap_embedding,
+  key = "UMAP_",
+  assay = "RNA"
+)
+
+pca_embedding <- rna_h5ad[['obsm']][['X_pca']]
+colnames(pca_embedding) <- paste0("PC_", 1:ncol(pca_embedding))
+rownames(pca_embedding) <- colnames(rna_obj)
+rna_obj[["pca"]] <- Seurat::CreateDimReducObject(
+  embeddings = pca_embedding,
+  key = "PC_",
+  assay = "RNA"
+)
+
+scVI_embedding <- rna_h5ad[['obsm']][['X_scVI']]
+colnames(scVI_embedding) <- paste0("scVI_", 1:ncol(scVI_embedding))
+rownames(scVI_embedding) <- colnames(rna_obj)
+rna_obj[["scVI"]] <- Seurat::CreateDimReducObject(
+  embeddings = scVI_embedding,
+  key = "scVI_",
+  assay = "RNA"
+)
+
+scANVI_embedding <- rna_h5ad[['obsm']][['X_scANVI']]
+colnames(scANVI_embedding) <- paste0("scANVI_", 1:ncol(scANVI_embedding))
+rownames(scANVI_embedding) <- colnames(rna_obj)
+rna_obj[["scANVI"]] <- Seurat::CreateDimReducObject(
+  embeddings = scANVI_embedding,
+  key = "scANVI_",
+  assay = "RNA"
+)
+
+Seurat::DimPlot(rna_obj, group.by  = 'human_celltype_pred_broad')
+Seurat::FeaturePlot(rna_obj, features = c('Lmx1a'))
+
+saveRDS(rna_obj,file.path(Sys.getenv("COMMONR"),"sex_bias/processed/mouse/multiome/writes/UBCenrichedE16Multiome_seurat.RDS"))
+
+
+```
+
+# START HERE: Start from project RDS
+
+# Filter snATAC
+```{r}
+workDir <- file.path(Sys.getenv("COMMONR"),"sex_bias")
+outpath <- file.path(workDir, "processed/mouse/multiome/snATAC/UBCenrichedE16Multiome")
+
+projPat1 <- loadArchRProject(path =outpath) 
+getOutputDirectory(projPat1)
+
+nfrag=1000
+cat(paste0("# filtering based on nFragments: ",nfrag, "."))
+idxPass <- which(projPat1$nFrags >= nfrag)
+length(idxPass)
+cellsPass <- projPat1$cellNames[idxPass]
+projPat1 <- projPat1[cellsPass, ]
+
+tssEnrich=4 # this was based on unfiltered distribution
+cat(paste0("# filtering based on TSS enrichment: ",tssEnrich, ".\n"))
+idxPass <- which(projPat1$TSSEnrichment >= tssEnrich)
+length(idxPass)
+cellsPass <- projPat1$cellNames[idxPass]
+projPat1 <- projPat1[cellsPass, ]
+
+# Estimate doublet scores
+cat("# Estimating doublet scores\n")
+doubScores <- addDoubletScores(
+  projPat1
+)
+
+cat(paste0("# filtering doublets with default filter ratio of 1\n"))
+projPat1 <- filterDoublets(projPat1)# default filter ratio is 1
+projPat1
+
+saveArchRProject(ArchRProj = projPat1, outputDirectory =outpath, load = FALSE)
+
+```
+
+### -- match RNA and ATAC cells
+
+###### --- reset to raw
+```{r}
+
+
+# ArrowFiles <- list.files(inpath, pattern = ".arrow$", full.names = TRUE)
+# cat(paste0("# Number of arrow files: ", length(ArrowFiles), "\n"))
+# 
+# # Create ArchR Project
+# cat("# Creating ArchR Project\n")
+# projPat1 <- ArchRProject(
+#   ArrowFiles = ArrowFiles,
+#   outputDirectory = outpath,
+#   copyArrows = TRUE # Recommended so that you have an original copy
+# )
+# saveArchRProject(ArchRProj = projPat1, outputDirectory = outpath, load = FALSE)
+
+
+```
+
+### -- get RNA and ATAC object
+```{r}
+
+
+# load object from inpath if need to go back to the original obj
+projPat1 <- loadArchRProject(path =outpath) 
+getOutputDirectory(projPat1)
+
+cat(paste0("Memory Size = ", round(object.size(projPat1) / 10^6, 3), " MB."))
+
+rna_obj <- readRDS(file.path(Sys.getenv("COMMONR"),"sex_bias/processed/mouse/multiome/writes/UBCenrichedE16Multiome_seurat.RDS"))
+# rna_obj@assays$RNA$data
+
+```
+### --- get shared cells
+```{r}
+
+# rename rna cells in ATAC format
+sample_meta <- rna_obj@meta.data
+sample_meta$atac_cellid <- mapply(function(x,y){ 
+  s <- unlist(strsplit(x, split = '_',fixed=T))
+  batch_names <- s[2]
+  cellname <- s[1]
+  sample_id <- y
+  paste0(batch_names, '#', cellname , sample_id)
+  },
+  rownames(sample_meta),sample_meta$sample_batch)
+rna_obj@meta.data$atac_cellid <- sample_meta$atac_cellid
+
+
+
+# shared cells between RNA and ATAC
+shared_cells <- intersect(sample_meta$atac_cellid, rownames(projPat1@cellColData))
+
+length(sample_meta$atac_cellid) # n rna cells
+length(rownames(projPat1@cellColData)) # n atac cells
+length(shared_cells)
+
+```
+
+### --- subset objects
+```{r}
+
+atac_meta_subset <- projPat1@cellColData[shared_cells,]
+
+# merge metadata
+cellColData_df <- left_join(as.data.frame(atac_meta_subset) %>% tibble::rownames_to_column("atac_cellid"), sample_meta, by ="atac_cellid")
+rownames(cellColData_df) <- cellColData_df$atac_cellid
+
+# subset RNA object
+rna_obj_shared <- rna_obj[,rownames(rna_obj@meta.data[rna_obj@meta.data$atac_cellid %in% shared_cells,])]
+
+# subset ATAC object
+projPat1_subset <- projPat1[shared_cells, ]
+
+for(col in c('human_celltype_pred', 'human_celltype_pred_broad', 'human_celltype_pred_broad1', 'human_celltype_pred_lvl1', 'human_celltype_pred_lvl2', 'human_celltype_pred_lvl3', 'Age_days', 'Sex', 'leiden', 'Age')){
+  projPat1_subset@cellColData[paste0('rna_',col)] <- cellColData_df[rownames(projPat1_subset@cellColData),][col] 
+
+}
+
+
+cat("# Save project to a RDS.")
+saveRDS(rna_obj_shared,file.path(Sys.getenv("COMMONR"),"sex_bias/processed/mouse/multiome/writes/UBCenrichedE16Multiome_ATACshared_seurat.RDS"))
+
+outpath <- file.path(Sys.getenv("COMMONR"),"sex_bias/processed/mouse/multiome/snATAC/UBCenrichedE16Multiome_RNAATACshared")
+projPat1_subset@projectMetadata$outputDirectory <- outpath
+saveArchRProject(ArchRProj = projPat1_subset, outputDirectory =outpath, load = T)
+projPat1_subset
+# projPat1_subset@cellColData
+```
+
+# add matching RNA cells to ATAC project
+```{r}
+
+rna_obj_shared <- readRDS(file.path(Sys.getenv("COMMONR"),"sex_bias/processed/mouse/multiome/writes/UBCenrichedE16Multiome_ATACshared_seurat.RDS"))
+
+library(GenomicFeatures)
+library(GenomicRanges)
+
+# Use the SAME GTF that you used for ArchR
+gtf_path <- file.path(Sys.getenv("HOME"),"refdata-cellranger-arc-GRCm39-2024-A/genes/genes.gtf.gz")
+
+# Import genes from this GTF
+txdb <- makeTxDbFromGFF(gtf_path, format = "gtf")
+genes <- genes(txdb)
+
+library(ensembldb)
+# Import GTF with gene_name field
+gtf <- rtracklayer::import(gtf_path)
+gene_info <- unique(as.data.frame(mcols(gtf)[, c("gene_id", "gene_name")]))
+gene_info <- gene_info[!is.na(gene_info$gene_name),]
+
+# Match and add gene_name to genes
+genes$gene_name <- gene_info$gene_name[match(genes$gene_id, gene_info$gene_id)]
+
+gene_names <- rownames(rna_obj_shared@assays$RNA$counts)
+gene_match_idx <- match(gene_names, genes$gene_name)
+genes_keep <- !is.na(gene_match_idx)
+
+# Subset to matched genes only
+gene_names_matched <- gene_names[genes_keep]
+counts_matched <- rna_obj_shared@assays$RNA$counts[genes_keep, ]
+genes_matched <- genes[gene_match_idx[genes_keep]]
+names(genes_matched) <- gene_names_matched
+
+# Create RangedSummarizedExperiment
+rna_meta <- rna_obj_shared@meta.data
+rownames(rna_meta) <- rna_meta$atac_cellid
+counts_reordered <- rna_obj_shared@assays$RNA$counts
+colnames(counts_reordered) <- rna_meta$atac_cellid
+
+# Make sure everything has the same dimensions
+counts_matched <- counts_matched[names(genes_matched), ]  # Reorder rows to match genes_matched
+colnames(counts_matched) <- rna_meta$atac_cellid
+
+# Verify dimensions match
+stopifnot(nrow(counts_matched) == length(genes_matched))
+stopifnot(ncol(counts_matched) == nrow(rna_meta))
+
+# Then create the SummarizedExperiment
+seRNA <- SummarizedExperiment(
+    assays = list(counts = counts_matched),
+    rowRanges = genes_matched,
+    colData = rna_meta
+)
+
+projPat1_subset <- addGeneExpressionMatrix(input = projPat1_subset, seRNA = seRNA, strictMatch = TRUE, force = TRUE)
+
+saveArchRProject(ArchRProj = projPat1_subset, outputDirectory =outpath, load = T)
+getAvailableMatrices(projPat1_subset)
+```
+
+```{r}
+
+workDir <- file.path(Sys.getenv("COMMONR"),"sex_bias")
+outpath <- file.path(workDir, "processed/mouse/multiome/snATAC/UBCenrichedE16Multiome_RNAATACshared")
+
+projPat1 <- loadArchRProject(path =outpath) 
+
+```
+
+# Dim Reduction
+
+```{r}
+
+
+script_content <- '
+library(ArchR)
+
+cat("# known seed for replication\n")
+set.seed(1)
+
+cat("# add ArchR params")
+addArchRThreads(threads = 1) 
+
+geneAnno <- readRDS(file.path(Sys.getenv("HOME"),"references/Mus_musculus/mm39_ArchR/mm39_geneAnnotation.rds"))
+genomeAnno <- readRDS(file.path(Sys.getenv("HOME"),"references/Mus_musculus/mm39_ArchR/mm39_genomeAnnotation.rds"))
+
+workDir <- file.path(Sys.getenv("COMMONR"),"sex_bias")
+outpath <- file.path(workDir, "processed/mouse/multiome/snATAC/UBCenrichedE16Multiome_RNAATACshared")
+
+projPat1 <- loadArchRProject(path =outpath) 
+getOutputDirectory(projPat1)
+
+cat("# add LSI dimension reduction\n")
+projPat1 <- addIterativeLSI(
+    ArchRProj = projPat1,
+    useMatrix = "TileMatrix",
+    name = "IterativeLSI",
+    iterations = 2,
+    clusterParams = list(resolution = c(2), sampleCells = 10000, maxClusters = 10, n.start= 10),
+    varFeatures = 25000,
+    dimsToUse = 1:30,
+    excludeChr = c(),
+     UMAPParams = list(n_neighbors = 40, min_dist = 0.2, metric = "cosine", verbose =
+    FALSE, fast_sgd = TRUE, spread = 2)
+)
+
+
+cat("# compute clusters based on LSI\n")
+
+library(reticulate)
+use_python(file.path(Sys.getenv("HOME"),"/miniconda3/envs/seurat4.4.0/bin/python"), required = TRUE)
+py_config()
+
+projPat1 <- addClusters(
+    input = projPat1,
+    reducedDims = "IterativeLSI",
+    method = "Seurat",
+    name = "Clusters",
+    algorithm = 4, # leiden
+    force = T,
+    resolution =  2,
+    maxClusters = 100
+)
+
+fig_path <- file.path(outpath, "figures")
+if (!file.exists(fig_path)) {
+  dir.create(fig_path, recursive = TRUE)
+  message("Directory created: ", fig_path)
+} 
+
+# which sample is in which cluster
+cM <- confusionMatrix(paste0(projPat1$Clusters), paste0(projPat1$Sample))
+
+cM <- cM / Matrix::rowSums(cM)
+
+# pdf(file.path(outpath, "figures", "confusion_matrix_sample_vs_cluster.pdf"))
+# pheatmap::pheatmap(
+#     mat = as.matrix(cM),
+#     color = paletteContinuous("whiteBlue"),
+#     border_color = "black"
+# )
+# dev.off()
+
+cat("# add UMAP\n")
+projPat1 <- addUMAP(
+    ArchRProj = projPat1,
+    reducedDims = "IterativeLSI",
+    name = "UMAP_ATAC",
+    nNeighbors = 40,
+    minDist = 0.4,
+    metric = "cosine"
+)
+
+cat("# add imputated expression.\n")
+projPat1 <- addImputeWeights(projPat1)
+
+
+cat("# saveRDS")
+saveArchRProject(ArchRProj =projPat1, outputDirectory =outpath, load = FALSE)
+'
+
+
+writeLines(script_content, con = file.path(inpath, "get_LSI_DimRed_UMAP.R"))
+file.path(inpath, "get_LSI_DimRed_UMAP.R")
+
+```
+
+```{bash}
+
+cd $COMMONR/sex_bias/scripts/UBCenrichedE16Multiome/snATAC_mutiome
+
+bsub -q priority -P get_LSI_DimRed_UMAP -R "rusage[mem=100GB]" -R "span[hosts=1]" -n 1 -o "log/get_LSI_DimRed_UMAP.%J.out" -e "log/get_LSI_DimRed_UMAP.%J.out" "source activate R_conda_env_4.0.5; Rscript get_LSI_DimRed_UMAP.R"
+
+
+```
+
+# Explore UMAP
+
+```{r}
+
+workDir <- file.path(Sys.getenv("COMMONR"),"sex_bias")
+inpath <- file.path(workDir, "scripts/UBCenrichedE16Multiome/snATAC_mutiome") # dir with original arrow files
+outpath <- file.path(workDir, "processed/mouse/multiome/snATAC/UBCenrichedE16Multiome_RNAATACshared")
+
+proj1 <- loadArchRProject(path = outpath)
+proj1
+
+```
+
+```{r}
+
+proj1@cellColData
+
+p1 <- plotEmbedding(ArchRProj = proj1, colorBy = "cellColData", name = "Sample", embedding ="UMAP_ATAC")
+p1
+
+p2 <- plotEmbedding(ArchRProj = proj1, colorBy = "cellColData", name = "rna_human_celltype_pred", embedding = "UMAP_ATAC")
+p2
+
+p3 <- plotEmbedding(ArchRProj = proj1, colorBy = "cellColData", name = "rna_human_celltype_pred_broad", embedding = "UMAP_ATAC")
+p3
+
+metadata_col_4 <- "rna_leiden"
+p4 <- plotEmbedding(ArchRProj = proj1, colorBy = "cellColData", name = metadata_col_4, embedding = "UMAP_ATAC")
+p4
+
+metadata_col_5 <- "Clusters"
+p5 <- plotEmbedding(ArchRProj = proj1, colorBy = "cellColData", name = metadata_col_5, embedding = "UMAP_ATAC")
+p5
+
+
+plotPDF(p1, p2,p3,p4, p5,name = "Plot-UMAP-Metadata.pdf", ArchRProj = proj1, addDOC = FALSE, width = 15, height = 15)
+```
+
+
+# Call peaks with pseudobulks
+```{r}
+script_content <- '
+library(ArchR)
+
+cat("# known seed for replication\n")
+set.seed(1)
+
+cat("# add ArchR params")
+addArchRThreads(threads = 8) 
+
+geneAnno <- readRDS(file.path(Sys.getenv("HOME"),"references/Mus_musculus/mm39_ArchR/mm39_geneAnnotation.rds"))
+genomeAnno <- readRDS(file.path(Sys.getenv("HOME"),"references/Mus_musculus/mm39_ArchR/mm39_genomeAnnotation.rds"))
+
+library(BSgenome.Mmusculus.UCSC.mm39)
+
+workDir <- file.path(Sys.getenv("COMMONR"),"sex_bias")
+outpath <- file.path(workDir, "processed/mouse/multiome/snATAC/UBCenrichedE16Multiome_RNAATACshared")
+
+cat("# read in RAW RDS\n")
+proj1 <- loadArchRProject(path = outpath) # read from copied arrowfiles
+proj1
+
+cat("# pseudo-bulk replicates based on \n")
+groupby= "Clusters"
+proj1 <- addGroupCoverages(ArchRProj = proj1, groupBy = groupby,  threads = 8)
+
+
+pathToMacs2 <- file.path(Sys.getenv("HOME"),"miniconda3/envs/R_conda_env_4.0.5/bin/macs2")
+genome_size <- sum(seqlengths(proj1@genomeAnnotation$chromSizes))
+proj1 <- addReproduciblePeakSet(
+
+    ArchRProj = proj1,
+
+    groupBy = groupby,
+
+    pathToMacs2 = pathToMacs2,
+    geneAnnotation = geneAnno,
+    genomeAnnotation = genomeAnno,
+    genomeSize = "mm"
+    
+)
+
+proj1 <- addPeakMatrix(proj1)
+
+cat("# saveRDS")
+saveArchRProject(ArchRProj = proj1, outputDirectory =outpath, load = FALSE)
+'
+
+writeLines(script_content, con= file.path(inpath,   "pseudoBulk_replicates.R"))
+file.path(inpath,   "pseudoBulk_replicates.R")
+```
+
+```{bash}
+cd $COMMONR/sex_bias/scripts/UBCenrichedE16Multiome/snATAC_mutiome
+
+bsub -q priority -P pseudoBulk_replicates_callPeaks -R "rusage[mem=100GB]" -R "span[hosts=1]" -n 1 -o "log/pseudoBulk_replicates_callPeaks.%J.out" -e "log/pseudoBulk_replicates_callPeaks.%J.out" "source activate R_conda_env_4.0.5; Rscript  pseudoBulk_replicates.R"
+
+
+```
+
+# Explore Peak callled project
+```{r}
+
+
+workDir <- file.path(Sys.getenv("COMMONR"),"sex_bias")
+inpath <- file.path(workDir, "scripts/UBCenrichedE16Multiome/snATAC_mutiome") # dir with original arrow files
+outpath <- file.path(workDir, "processed/mouse/multiome/snATAC/UBCenrichedE16Multiome_RNAATACshared")
+
+
+set.seed(1)
+
+cat("# Add ArchR params\n")
+addArchRThreads(threads = 1) 
+
+```
+
+```{r}
+
+proj1 <- loadArchRProject(path = outpath)
+proj1
+
+colnames(proj1@cellColData)
+
+proj1@cellColData$Sex_celltypeBroad <- paste0(proj1@cellColData$rna_Sex, '_', proj1@cellColData$rna_human_celltype_pred_broad)
+
+proj1@cellColData$Sex_celltype <- paste0(proj1@cellColData$rna_Sex, '_', proj1@cellColData$rna_human_celltype_pred)
+```
+
+
+```{r}
+getAvailableMatrices(proj1)
+
+```
+
+# Markers per sex at all celltypes
+```{r}
+
+selected_group <- names(table(proj1@cellColData$Sex_celltypeBroad )[table(proj1@cellColData$Sex_celltypeBroad ) > 10])
+
+markerPeaks <- getMarkerFeatures(
+    ArchRProj = proj1,
+    useMatrix = "PeakMatrix",
+    groupBy = "Sex_celltypeBroad",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  testMethod = "wilcoxon",
+  useGroups = selected_group,
+  bgdGroups = selected_group,
+)
+
+saveRDS(markerPeaks, file.path(outpath, 'RDS', 'Sex_celltypeBroad_markerPeaks.RDS'))
+
+
+```
+
+```{r}
+
+a <- unique(proj1@cellColData["Sex_celltypeBroad"]$Sex_celltypeBroad)
+
+
+p <- plotBrowserTrack(
+    ArchRProj = proj1, 
+    groupBy = "Sex_celltypeBroad", 
+    geneSymbol = 'Maz',
+    upstream = 10000,
+    downstream = 10000,
+    useGroups = a[grepl('UBC|RL',a, fixed = F)]
+    
+)
+
+
+
+grid::grid.newpage()
+grid::grid.draw(p[[1]])
+
+
+```
+
+### --- overall sex-baised peaks across celltypes
+```{r}
+
+markerPeaks <- readRDS(file.path(outpath, 'RDS', 'Sex_celltypeBroad_markerPeaks.RDS'))
+# 
+# markerList <- getMarkers(markerPeaks, cutOff = "FDR <= 0.05 & Log2FC >= 1")
+# names(markerList)
+
+# Get the groups you want
+groups_to_plot <- c("M_UBC_GNP_progenitors", "F_UBC_GNP_progenitors", "M_UBC", "F_UBC")
+
+# Subset the SummarizedExperiment
+seMarker_subset <- markerPeaks[, colnames(markerPeaks) %in% groups_to_plot]
+
+
+
+seMarker_subset@assays@data$AUC
+seMarker_subset@assays@data$MeanBGD
+
+heatmapPeaks <- plotMarkerHeatmap(
+  seMarker = seMarker_subset, 
+  cutOff = "FDR <= 0.01 & Log2FC >= 3 & MeanBGD > 0",
+  transpose = F,
+  labelRows = F
+
+)
+heatmapPeaks 
+plotPDF(heatmapPeaks , name = "UBC_Sex_markerPeaks", width = 5, height = 5, ArchRProj = proj1, addDOC = FALSE)
+
+
+# Loop through each celltype and export as BED file
+for (ct in names(markerList)) {
+  # Filter data for this celltype
+  ct_data <- as.data.frame(markerList[[ct]]) %>%
+    subset(FDR < 0.05 & Log2FC > 1) %>%
+    mutate(pi = Log2FC*-log10(FDR)) %>% 
+     # slice_max(pi, n= 500) %>%
+    dplyr::select(seqnames, start, end) %>%
+    arrange(seqnames, start) 
+    
+  
+  # Create filename (sanitize celltype name for filename)
+  filename <- file.path(outpath, "tables",
+                        paste0( ct, ".bed"))
+  
+  # Write BED file (tab-separated, no header, no quotes, no row names)
+  write.table(ct_data, 
+              file = filename,
+              sep = "\t",
+              quote = FALSE,
+              row.names = FALSE,
+              col.names = FALSE)
+  
+  cat("Exported", nrow(ct_data), "regions for", ct, "to", filename, "\n")
+}
+
+
+
+```
+### --- Motif enrichment
+```{r}
+
+if("Motif" %ni% names(proj1@peakAnnotation)){
+    proj1 <- addMotifAnnotations(ArchRProj = proj1, motifSet = "cisbp", name = "Motif")
+}
+
+motifsUp <- peakAnnoEnrichment(
+    seMarker = seMarker_subset ,
+    ArchRProj = proj1,
+    peakAnnotation = "Motif",
+    cutOff = "FDR <= 0.05 & Log2FC >= 1 & MeanBGD > 0",
+    background = "bgdPeaks"
+  )
+
+
+heatmapEM <- plotEnrichHeatmap(motifsUp, n = 10, transpose = TRUE, cutOff = 20, clusterCols = T)
+
+ComplexHeatmap::draw(heatmapEM, heatmap_legend_side = "bot", annotation_legend_side = "bot")
+```
+### -- pairwise sex-biased 
+```{r}
+
+
+markerPeaks <- getMarkerFeatures(
+    ArchRProj = proj1,
+    useMatrix = "PeakMatrix",
+    groupBy = "Sex_celltype",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  testMethod = "wilcoxon",
+  #   useGroups = 'M_UBC_GNP_progenitors',
+  # bgdGroups = 'F_UBC_GNP_progenitors',
+      useGroups = 'M_UBC_early',
+  bgdGroups = 'F_UBC_early',
+)
+
+# saveRDS(markerPeaks, file.path(outpath, 'RDS', 'Sex_celltypeBroad_UBC_GNP_progenitors_markerPeaks.RDS'))
+
+```
+
+
+```{r}
+# markerPeaks <- readRDS(file.path(outpath, 'RDS', 'Sex_celltypeBroad_UBC_GNP_progenitors_markerPeaks.RDS'))
+
+
+# markerList <- getMarkers(markerPeaks, cutOff = "FDR <= 0.05 & abs(Log2FC) >= 1")
+# names(markerList)
+# 
+# marker_df <- markerList$M_UBC_GNP_progenitors %>% subset(FDR < 0.05 & Log2FC > 1)
+
+marker_df <- data.frame(
+    markerPeaks@elementMetadata
+)
+
+
+marker_df$FDR <-(markerPeaks@assays@data$FDR$x)
+marker_df$Log2FC<- markerPeaks@assays@data$Log2FC$x
+marker_df$MeanBGD <- markerPeaks@assays@data$MeanBGD$x
+marker_df$MeanDiff <- markerPeaks@assays@data$MeanDiff$x
+marker_df$AUC <- markerPeaks@assays@data$AUC$x
+marker_df
+
+# marker_df <- marker_df[marker_df$MeanBGD > 0.1,]
+
+# quantile(marker_df$AUC)
+
+marker_df$label <- ifelse(marker_df$FDR < 0.05 & marker_df$Log2FC > 1, 'up_in_M', 
+                          ifelse(marker_df$FDR < 0.05 & marker_df$Log2FC < -1 , 'up_in_F', 'NS'))
+
+p1 <- ggplot(marker_df, aes(x = Log2FC, y = -log10(FDR)))+  # log10, not log
+  geom_point(aes(color = label))+
+  geom_hline(yintercept = -log10(0.05), linetype = 'dashed', color = 'black')+  # Remove aes()
+  geom_vline(xintercept = c(-1, 1), linetype = 'dashed', color = 'black')+  # Remove aes()
+  theme_classic()+
+  scale_color_manual(values = c('up_in_M'= 'blue', 'up_in_F'='salmon', 'NS'='grey'))
+p1
+ggsave(file.path(outpath, 'Plots', 'DiffPeaks_UBC_GNP_progenitors_MvF.pdf'), p1, width = 7, height = 5)
+
+marker_df %>% subset(FDR < 0.05 & Log2FC > 1) %>% arrange(desc(Log2FC))
+```
+
+```{r}
+
+
+p <- plotBrowserTrack(
+    ArchRProj = proj1, 
+    groupBy = "Sex_celltypeBroad", 
+    geneSymbol = 'Maz',
+    features =  getMarkers(markerPeaks, cutOff = "FDR <= 0.05 & Log2FC >= 1", returnGR = TRUE)["M_UBC_GNP_progenitors"],
+    upstream = 20000,
+    downstream = 20000
+)
+
+grid::grid.newpage()
+grid::grid.draw(p[[1]])
+
+```
+### --- Motif enrichment for pairwise compairson
+```{r}
+
+if("Motif" %ni% names(proj1@peakAnnotation)){
+    proj1 <- addMotifAnnotations(ArchRProj = proj1, motifSet = "cisbp", name = "Motif")
+}
+
+motifsUp <- peakAnnoEnrichment(
+    seMarker = markerPeaks ,
+    ArchRProj = proj1,
+    peakAnnotation = "Motif",
+    cutOff = "FDR <= 0.05 & Log2FC <= -1",
+    background = "bgdPeaks"
+  )
+motifsUp@assays@data$Enrichment
+
+df <- data.frame(TF = rownames(motifsUp), mlog10Padj = assay(motifsUp)[,1])
+df <- df[order(df$mlog10Padj, decreasing = TRUE),]
+df$rank <- seq_len(nrow(df))
+
+ggUp <- ggplot(df, aes(rank, mlog10Padj, color = mlog10Padj)) + 
+  geom_point(size = 1) +
+  ggrepel::geom_label_repel(
+        data = df[rev(seq_len(10)), ], aes(x = rank, y = mlog10Padj, label = TF), 
+        size = 2,
+        nudge_x = 2,
+        color = "black",
+        max.overlaps = 50
+  ) + theme_ArchR() + 
+  ylab("-log10(P-adj) Motif Enrichment") + 
+  xlab("Rank Sorted TFs Enriched") +
+  scale_color_gradientn(colors = paletteContinuous(set = "comet"))
+
+ggUp
+## Warning: ggrepel: 23 unlabeled data points (too many overlaps). Consider
+## increasing max.overlaps
+```
+
+# add peak2Gene link
+```{r}
+# getAvailableMatrices(proj1)
+# proj1 <- addPeak2GeneLinks(
+#     ArchRProj = proj1,
+#     reducedDims = "IterativeLSI",
+#     useMatrix ="GeneExpressionMatrix"
+# )
+# proj1
+# 
+# p2g_pos <- getPeak2GeneLinks(
+#     ArchRProj = proj1,
+#     corCutOff = 0.01,
+#     resolution = 1,
+#     returnLoops = FALSE
+# )
+# 
+# p2g_neg <- getPeak2GeneLinks(
+#     ArchRProj = proj1,
+#     corCutOff =-0.01,
+#     resolution = 1,
+#     returnLoops = FALSE
+# )
+# 
+# p2g_pos_df <- as.data.frame(p2g_pos)
+# p2g_pos_df$geneName <- mcols(metadata(p2g_pos)$geneSet)$name[p2g_pos$idxRNA]
+# p2g_neg_df <- as.data.frame(p2g_neg) 
+# p2g_neg_df$geneName <- mcols(metadata(p2g_neg)$geneSet)$name[p2g_neg$idxRNA]
+# p2g_df <- rbind(p2g_pos_df, p2g_neg_df)
+# 
+# M_up_peaks <- marker_df %>% subset(FDR < 0.05 & Log2FC > 1)
+# 
+# M_up_peaks_geneAnot <- left_join(M_up_peaks, p2g_df, by = c('idx'='idxATAC')) %>% subset(!is.na(idxRNA))
+# as.data.frame(table(M_up_peaks_geneAnot$geneName)) %>% arrange(desc(Freq))
+```
+
+
+```{r}
+
+# markerGenes  <- c(
+#     "IGFBP2" 
+#   )
+# 
+# 
+# 
+# p <- plotBrowserTrack(
+#     ArchRProj = proj1, 
+#     groupBy = "rna_Sex", 
+#     geneSymbol = markerGenes, 
+#     upstream = 50000,
+#     downstream = 50000
+# )
+
+```
+
+
+
+
+# chromVar
+
+```{r}
+
+
+workDir <- file.path(Sys.getenv("COMMONR"),"sex_bias")
+inpath <- file.path(workDir, "scripts/UBCenrichedE16Multiome/snATAC_mutiome") # dir with original arrow files
+outpath <- file.path(workDir, "processed/mouse/multiome/snATAC/UBCenrichedE16Multiome_RNAATACshared")
+
+
+set.seed(1)
+
+cat("# Add ArchR params\n")
+addArchRThreads(threads = 1) 
+
+```
+
+```{r}
+
+proj1 <- loadArchRProject(path = outpath)
+proj1
+
+colnames(proj1@cellColData)
+
+proj1@cellColData$Sex_celltypeBroad <- paste0(proj1@cellColData$rna_Sex, '_', proj1@cellColData$rna_human_celltype_pred_broad)
+
+proj1@cellColData$Sex_celltype <- paste0(proj1@cellColData$rna_Sex, '_', proj1@cellColData$rna_human_celltype_pred)
+```
+
+### -- add chromVar matrix
+```{r}
+
+# proj1 <- addBgdPeaks(proj1)
+# 
+# proj1 <- addDeviationsMatrix(
+#   ArchRProj = proj1, 
+#   peakAnnotation = "Motif",
+#   force = TRUE
+# )
+# 
+# getAvailableMatrices(proj1) 
+# saveArchRProject(ArchRProj = proj1, outputDirectory =outpath, load = FALSE)
+
+```
+# Correlate TF expression with motif accessibility
+```{r}
+
+# run once
+
+corGSM_MM <- correlateMatrices(
+    ArchRProj = proj1,
+    useMatrix1 = "GeneExpressionMatrix",
+    useMatrix2 = "MotifMatrix",
+    reducedDims = "IterativeLSI"
+)
+
+```
+
+### --- pairwise chromvar activity
+
+```{r}
+
+groupBy <- "Sex_celltypeBroad"
+
+
+markerMotifs <- getMarkerFeatures(
+    ArchRProj = proj1,
+    useMatrix = "MotifMatrix",
+    groupBy = groupBy,
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  testMethod = "wilcoxon",
+    useGroups = "M_UBC_GNP_progenitors",
+  bgdGroups = "F_UBC_GNP_progenitors",
+  useSeqnames = 'z'
+)
+
+markerMotifs
+
+marker_df <- data.frame(
+    markerMotifs@elementMetadata
+)
+
+marker_df$FDR <-(markerMotifs@assays@data$FDR[,1])
+marker_df$MeanDiff<- markerMotifs@assays@data$MeanDiff[,1]
+marker_df$Mean<- markerMotifs@assays@data$Mean[,1]
+marker_df$MeanBGD<- markerMotifs@assays@data$MeanBGD[,1]
+marker_df <- marker_df %>% subset(MeanBGD > 0) # make sure the large difference is not due to reference as 0
+
+```
+
+
+
+```{r}
+
+
+corGSM_MM$MeanDiff <- marker_df[match(corGSM_MM$MotifMatrix_name, marker_df$name), "MeanDiff"]
+corGSM_MM$FDR <- marker_df[match(corGSM_MM$MotifMatrix_name, marker_df$name), "FDR"]
+
+# 4. Filter for active TF regulators
+corGSM_MM <- corGSM_MM[order(abs(corGSM_MM$cor), decreasing = TRUE), ]
+corGSM_MM <- corGSM_MM[which(!duplicated(gsub("\\-.*", "", corGSM_MM[,"MotifMatrix_name"]))), ]
+
+corGSM_MM$TFRegulator <- "NO"
+corGSM_MM$TFRegulator[which(
+    ceiling((corGSM_MM$cor) * 10) >= 5 & 
+    corGSM_MM$padj < 0.05 & 
+    abs(as.numeric(corGSM_MM$MeanDiff)) > 0.5 &  
+    as.numeric(corGSM_MM$FDR) < 0.05
+)] <- "YES"
+
+corGSM_MM[corGSM_MM$TFRegulator=="YES", ]
+corrlated_TFs <- sort(corGSM_MM[corGSM_MM$TFRegulator=="YES", 1])
+
+corGSM_MM[corGSM_MM$GeneExpressionMatrix_name == "Etv1",]
+```
+
+```{r}
+
+# markerMotifs <- readRDS(file.path(outpath, 'RDS', 'Sex_celltypeBroad_UBC_GNP_progenitors_markerMotifs.RDS'))
+# metadata(markerMotifs)
+
+fdr_threshold <- 0.05
+diff_t <- 0.5
+
+# Label differential genes
+marker_df$label <- ifelse(marker_df$FDR < fdr_threshold & abs(marker_df$MeanDiff) > diff_t,
+                          ifelse(marker_df$MeanDiff > 0, 'up_in_M', 'up_in_F'), 'NS')
+
+# Extract gene name
+marker_df$name_short <- sub('_.*', '', marker_df$name)
+
+# Filter genes to label
+is_significant <- marker_df$label != 'NS' & !grepl('ENSMUS|Gm', marker_df$name_short)
+marker_df$sig_genes <- ifelse(is_significant & marker_df$name_short %in% corrlated_TFs, 
+                              marker_df$name_short, NA)
+marker_df$sig_genes2 <- ifelse(is_significant & marker_df$name_short %in% add_markers & 
+                               !marker_df$name_short %in% corrlated_TFs, 
+                               marker_df$name_short, NA)
+
+# Plot
+p1 <- ggplot(marker_df, aes(x = MeanDiff, y = -log10(FDR))) +
+  geom_point(aes(color = label)) +
+    geom_hline(yintercept = -log10(fdr_threshold), linetype = 'dashed', color = 'red') +
+  geom_vline(xintercept = c(-diff_t, diff_t), linetype = 'dashed', color = 'red') +
+  # ggrepel::geom_text_repel(aes(label = sig_genes2), max.overlaps = 20, color = 'darkgray', size = 3.5) +
+  ggrepel::geom_label_repel(aes(label = sig_genes), max.overlaps =20, color = 'black', size = 3.5) +
+
+  theme_classic() +
+  scale_color_manual(values = c('up_in_M' = 'blue', 'up_in_F' = 'salmon', 'NS' = 'grey'))
+p1
+ggsave(file.path(outpath, 'Plots', 'DiffPeaks_UBC_GNP_progenitors_MvF.pdf'), p1, width = 6, height = 4)
+unique(marker_df$sig_genes)
+
+
+```
+# Motif footprinting
+```{r}
+# library(BSgenome.Mmusculus.UCSC.mm39)
+# proj1 <- addGroupCoverages(ArchRProj = proj1, groupBy = "Sex_celltypeBroad")
+# proj1 <- addGroupCoverages(ArchRProj = proj1, groupBy = "Sex_celltype")
+# 
+# saveArchRProject(ArchRProj = proj1, outputDirectory =outpath, load = FALSE)
+```
+
+
+```{r}
+motifPositions <- getPositions(proj1)
+
+motifs <- c('Lmx1a', 'Otx2', 'Barhl1', 'Gbx1')
+markerMotifsNames <- unlist(lapply(motifs, function(x) grep(x, names(motifPositions), value = TRUE)))
+markerMotifsNames
+
+library(BSgenome)
+seFoot <- getFootprints(
+  ArchRProj = proj1, 
+  positions = motifPositions[markerMotifsNames], 
+ groupBy = "Sex_celltypeBroad",
+ useGroups = c("F_UBC_GNP_progenitors","M_UBC_GNP_progenitors", "F_UBC","M_UBC" ),
+)
+
+
+
+plotFootprints(
+  seFoot = seFoot,
+  ArchRProj = proj1, 
+  normMethod = "Subtract",
+  plotName = "Footprints-Subtract-Bias",
+  addDOC = FALSE,
+  smoothWindow = 10,
+  pal = c("F_UBC_GNP_progenitors" = "salmon","M_UBC_GNP_progenitors"="turquoise", "F_UBC" ="maroon","M_UBC"='darkblue' )
+)
+
+# seGroupMotif <- getGroupSE(ArchRProj = proj1, useMatrix = "MotifMatrix",groupBy = "Sex_celltypeBroad")
+
+```
+
+```{r}
+
+pwm <- getPeakAnnotation(proj1, "Motif")$motifs[["Otx2_437"]]
+
+PWMatrixToProbMatrix <- function(x){
+  if (class(x) != "PWMatrix") stop("x must be a TFBSTools::PWMatrix object")
+  m <- (exp(as(x, "matrix"))) * TFBSTools::bg(x)/sum(TFBSTools::bg(x))
+  m <- t(t(m)/colSums(m))
+  m
+}
+
+ppm <- PWMatrixToProbMatrix(pwm)
+ppm
+
+library(ggseqlogo)
+p1 <- ggseqlogo(ppm, method = "bits")
+p1
+ggsave(workDir <- file.path(Sys.getenv("COMMONR"),"sex_bias","figures/TF_motif.pdf"), width = 5, height = 2)
+
+```
+# --- closest gene to TF's motifs
+```{r}
+
+motifPositions <- getPositions(proj1)
+
+motifs <- c('Lmx1a', 'Otx2', 'Barhl1', 'Gbx1')
+markerMotifsNames <- unlist(lapply(motifs, function(x) grep(x, names(motifPositions), value = TRUE)))
+markerMotifsNames
+
+# "Lmx1a_456"  "Otx2_437"   "Barhl1_457" "Gbx1_571"  
+motif_gr <- motifPositions[[ "Lmx1a_456"]]  # Use actual motif ID
+
+# Find nearest genes using ArchR's gene annotation
+gene_anno <- getGeneAnnotation(proj1)
+nearest_genes <- distanceToNearest(motif_gr, gene_anno$genes, ignore.strand=FALSE)
+
+# Extract gene names
+genes <- unique(gene_anno$genes[subjectHits(nearest_genes)]$symbol)
+# genes[!grepl('ENSMUSG|Gm', genes)]
+
+
+```
+
+#### --- get motif positions and matrices
+```{r}
+
+# run once
+motifPositions <- getPositions(proj1)
+
+# Load matrices once
+activity_mat <- getMatrixFromProject(proj1, useMatrix = "GeneScoreMatrix")
+expr_mat <- getMatrixFromProject(proj1, useMatrix = "GeneExpressionMatrix")
+gene_anno <- getGeneAnnotation(proj1)
+
+rna_obj_shared <- readRDS(Sys.getenv("COMMONR"),"sex_bias","processed/mouse/multiome/writes/UBCenrichedE16Multiome_ATACshared_seurat.RDS"))
+rna_sp <- rna_obj_shared@assays$RNA$data
+colnames(rna_sp) <- rna_obj_shared@meta.data$atac_cellid
+expr_mat_log1p <- SummarizedExperiment(
+  assays  = SimpleList(data = rna_sp),
+  rowData = DataFrame(name = rownames(rna_sp)),
+  colData = DataFrame(cellNames = colnames(rna_sp))
+)
+expr_mat_log1p 
+expr_mat
+```
+
+```{r}
+motif_name <- "Barhl1_457"
+get_filtered_targets <- function(motif_name, proj, activity_mat, expr_mat, gene_anno, 
+                                 groupby, group1, group2) {
+  
+  # Get motif positions and nearest genes
+  motif_gr <- motifPositions[[motif_name]]
+  nearest <- distanceToNearest(motif_gr, gene_anno$genes, ignore.strand = FALSE)
+  genes <- unique(gene_anno$genes[subjectHits(nearest)]$symbol)
+  genes <- genes[!grepl('ENSMUSG|Gm|Rik', genes)]
+  length(genes)
+  
+  # Get genes present in both matrices
+  genes_in_activity <- genes[genes %in% rowData(activity_mat)$name]
+  genes_in_expr <- genes[genes %in% rowData(expr_mat)$name]
+  genes_both <- intersect(genes_in_activity, genes_in_expr)
+  
+  # Now indices have same length
+  activity_idx <- match(genes_both, rowData(activity_mat)$name)
+  expr_idx <- match(genes_both, rowData(expr_mat)$name)
+
+  # Subset cells
+  group_col <- getCellColData(proj, select = groupby)[,1]
+  cells_g1 <- proj$cellNames[group_col == group1]
+  cells_g2 <- proj$cellNames[group_col == group2]
+
+  
+  # Rest of function same...
+  activity_g1 <- rowMeans(assay(activity_mat)[activity_idx, cells_g1])
+  activity_g2 <- rowMeans(assay(activity_mat)[activity_idx, cells_g2])
+  
+  expr_g1 <- rowMeans(assay(expr_mat)[expr_idx, cells_g1])
+  expr_g2 <- rowMeans(assay(expr_mat)[expr_idx, cells_g2])
+  
+
+  # Convert to dense matrix first
+  g1_mat <- as.matrix(assay(activity_mat)[activity_idx, cells_g1])
+  g2_mat <- as.matrix(assay(activity_mat)[activity_idx, cells_g2])
+  
+  activity_test <- matrixTests::row_wilcoxon_twosample(g1_mat, g2_mat)
+  activity_pval <- activity_test$pvalue
+  
+  # Convert to dense matrix and use vectorized test
+  g1_expr <- as.matrix(assay(expr_mat)[expr_idx, cells_g1])
+  g2_expr <- as.matrix(assay(expr_mat)[expr_idx, cells_g2])
+  
+  expr_test <- matrixTests::row_wilcoxon_twosample(g1_expr, g2_expr)
+  expr_pval <- expr_test$pvalue
+  
+  result <- data.frame(
+    TF=motif_name,
+    gene = rowData(activity_mat)$name[activity_idx],
+    activity_g1 = activity_g1,
+    activity_g2 = activity_g2,
+    activity_diff = activity_g2 - activity_g1,
+    activity_pval = activity_pval,
+    activity_padj = p.adjust(activity_pval, method = "BH"),
+    expr_g1 = expr_g1,
+    expr_g2 = expr_g2,
+    expr_diff = expr_g2 - expr_g1,
+    expr_log2fc = log2((expr_g2 + 1) / (expr_g1 + 1)),
+    expr_pval = expr_pval,
+    expr_padj = p.adjust(expr_pval, method = "BH")
+  )
+  
+  return(result)
+}
+
+
+```
+
+
+# --- find differentially expressed/active genes from the motif targeted genes
+```{r}
+
+motifs <- c('Lmx1a', 'Otx2', 'Barhl1')
+markerMotifsNames <- unlist(lapply(motifs, function(x) grep(x, names(motifPositions), value = TRUE)))
+markerMotifsNames
+
+# M vs. F differentially expressed/active genes where lmx1a, otx2, barhl1 motif is
+results_RLsvz <- do.call(rbind,lapply(markerMotifsNames, function(m) {
+  get_filtered_targets(m, proj1, activity_mat, expr_mat_log1p, gene_anno,
+                       groupby = "Sex_celltypeBroad",
+                       group1 = "F_UBC_GNP_progenitors", 
+                       group2 = "M_UBC_GNP_progenitors")
+}))
+
+results_RLsvz#%>% subset(expr_padj < 0.05 & activity_padj  < 0.05 & expr_log2fc < 0 & activity_diff <0) %>% subset(TF == "Lmx1a_456")
+
+# write.csv(results_RLsvz, file.path(workDir, 'tables', 'RLsvz_M_vs_F_DiffOpenExp_Lmx1a_Otx2_Barhl1_motif_targeted_genes_comp.csv'))
+
+# UBC cells
+results_ubc <- do.call(rbind,lapply(markerMotifsNames, function(m) {
+  get_filtered_targets(m, proj1, activity_mat, expr_mat_log1p, gene_anno,
+                       groupby = "Sex_celltypeBroad",
+                       group1 = "F_UBC", 
+                       group2 = "M_UBC")
+}))
+
+results_ubc#%>% subset(expr_padj < 0.05 & activity_padj  < 0.05 & expr_log2fc < 0 & activity_diff <0) %>% subset(TF == "Lmx1a_456")
+
+# write.csv(results_ubc, file.path(workDir, 'tables', 'UBC_M_vs_F_DiffOpenExp_Lmx1a_Otx2_Barhl1_motif_targeted_genes_comp.csv'))
+
+results_RLsvz$cell_type <- 'UBC_GNP_progenitors'
+results_ubc$cell_type <- 'UBC'
+results <- rbind(results_RLsvz,results_ubc)
+
+# write.csv(results, file.path(workDir, 'tables', 'RLsvz_UBC_M_vs_F_DiffOpenExp_Lmx1a_Otx2_Barhl1_motif_targeted_genes_comp.csv'))
+```
+
+```{r}
+markerMotifsNames
+M_up_diff_Rlsvz <- results_RLsvz %>% subset(activity_padj < 0.05 & activity_diff > 0 & expr_padj < 0.05 & expr_log2fc > 0)
+M_up_diff_ubc <- results_ubc %>% subset(activity_padj < 0.05 & activity_diff > 0 & expr_padj < 0.05 & expr_log2fc > 0)
+as.data.frame(table(M_up_diff_Rlsvz$gene)) %>% arrange(desc(Freq))
+as.data.frame(table(M_up_diff_ubc$gene)) %>% arrange(desc(Freq))
+```
+
+```{r}
+
+library(dplyr)
+library(ComplexHeatmap)
+
+
+plot_gene_cell_expr_activity <- function(df,
+                                        cur_TF,
+                                        proj,
+                                        activity_mat,
+                                        expr_mat,
+                                        groupby,
+                                        group1,
+                                        group2,
+                                        n_cells_each = NULL,   # NULL => all cells
+                                        seed = 1,
+                                        padj_cutoff = 0.05,
+                                        max_genes = 50,
+                                        scale_mode = c("zscore", "none"),
+                                        clip = 2,              # 2 => [-2,2], 1 => [-1,1], NULL => no clip
+                                        use_raster = TRUE,
+                                        title_prefix = "") {
+  set.seed(seed)
+  scale_mode <- match.arg(scale_mode)
+
+  # ---- pick genes (union across TFs), top by expr_log2fc ----
+  genes_use <- df %>%
+  filter(
+    TF == cur_TF,
+    activity_padj < padj_cutoff,
+    activity_diff > 0,
+    expr_padj < padj_cutoff,
+    expr_log2fc > 0,
+    # pmin(activity_g1 , activity_g2) > 0,
+    # pmin(expr_g1 , expr_g2) > 0
+  ) %>%
+  mutate(score = activity_diff * expr_log2fc) %>%
+  arrange(desc(score)) %>%
+  slice_head(n = max_genes) %>%
+  pull(gene)
+
+
+  # ---- cells ----
+  group_col <- getCellColData(proj, select = groupby)[, 1]
+  cells_g1 <- proj$cellNames[group_col == group1]
+  cells_g2 <- proj$cellNames[group_col == group2]
+
+  cells_use <- if (is.null(n_cells_each)) {
+    c(cells_g1, cells_g2)
+  } else {
+    c(sample(cells_g1, min(n_cells_each, length(cells_g1))),
+      sample(cells_g2, min(n_cells_each, length(cells_g2))))
+  }
+
+  # ---- subset matrices ----
+  g_act <- rowData(activity_mat)$name
+  g_exp <- rowData(expr_mat)$name
+  genes_both <- intersect(genes_use, intersect(g_act, g_exp))
+  stopifnot(length(genes_both) > 1)
+
+  idx_act <- match(genes_both, g_act)
+  idx_exp <- match(genes_both, g_exp)
+
+  common_cells <- intersect(cells_use, intersect(colnames(assay(activity_mat)), colnames(assay(expr_mat))))
+  stopifnot(length(common_cells) > 1)
+
+  M_act  <- as.matrix(assay(activity_mat)[idx_act, common_cells, drop = FALSE])
+  M_expr <- as.matrix(assay(expr_mat)[idx_exp, common_cells, drop = FALSE])
+  rownames(M_act)  <- genes_both
+  rownames(M_expr) <- genes_both
+
+  # order columns: group1 then group2
+  col_group <- ifelse(colnames(M_expr) %in% cells_g1, group1, group2)
+  ord_cols <- order(col_group)
+  M_act  <- M_act[, ord_cols, drop = FALSE]
+  M_expr <- M_expr[, ord_cols, drop = FALSE]
+  col_group <- col_group[ord_cols]
+
+  # ---- scaling (row-wise) + optional clipping ----
+  row_z <- function(m) { m2 <- t(scale(t(m))); m2[!is.finite(m2)] <- 0; m2 }
+  clip_mat <- function(m, lim) {
+    if (is.null(lim)) return(m)
+    dn <- dimnames(m)
+    d  <- dim(m)
+    m2 <- pmax(-lim, pmin(lim, m))
+    dim(m2) <- d
+    dimnames(m2) <- dn
+    m2
+}
+
+  if (scale_mode == "zscore") {
+    M_expr <- row_z(M_expr)
+    M_act  <- row_z(M_act)
+  }
+  M_expr <- clip_mat(M_expr, clip)
+  M_act  <- clip_mat(M_act,  clip)
+
+
+  # ---- colors (fixed to clip range if provided) ----
+  lim_expr <- if (!is.null(clip)) clip else as.numeric(quantile(abs(M_expr), 0.95, na.rm = TRUE))
+  lim_act  <- if (!is.null(clip)) clip else as.numeric(quantile(abs(M_act),  0.95, na.rm = TRUE))
+  col_expr <- colorRamp2(c(-lim_expr,0, lim_expr), c("blue", 'white', "red"))
+  col_act  <- colorRamp2(c(-lim_act,0, lim_act),  c("purple", 'white', "#ffd22b"))
+
+  ha <- HeatmapAnnotation(
+  Group = col_group,
+  col = list(
+    Group = setNames(
+      c("#E41A1C",  "#3a53a4"),
+      c(group1, group2)
+    )
+  )
+)
+
+    # 1) build and draw expression heatmap ONCE to get row order
+    ht_expr0 <- Heatmap(
+      M_expr,
+      name = "Expr",
+      col = col_expr,
+      top_annotation = ha,
+      show_column_names = FALSE,
+      cluster_rows = TRUE,
+      cluster_columns = FALSE,
+      use_raster = TRUE
+    )
+    
+    ht_expr0_drawn <- draw(ht_expr0)
+    ord_rows <- row_order(ht_expr0_drawn)
+    
+    # 2) rebuild BOTH heatmaps with fixed row order (no clustering)
+    ht_expr <- Heatmap(
+      M_expr[ord_rows, , drop = FALSE],
+      name = "Expr",
+      col = col_expr,
+      top_annotation = ha,
+      show_column_names = FALSE,
+      cluster_rows = T,
+      cluster_columns = FALSE,
+      use_raster = TRUE
+    )
+    
+    ht_act <- Heatmap(
+      M_act[ord_rows, , drop = FALSE],
+      name = "Activity",
+      col = col_act,
+      top_annotation = ha,
+      show_column_names = FALSE,
+      cluster_rows = T,
+      cluster_columns = FALSE,
+      use_raster = TRUE
+    )
+    
+    # 3) now draw the NEW combined heatmaps (NOT ht_expr0_drawn)
+    suppressMessages(draw(ht_expr + ht_act))
+
+
+  invisible(list(expr = M_expr, activity = M_act, genes = genes_both, cells = colnames(M_expr), row_order = ord_rows))
+}
+
+
+a
+
+```
+
+
+```{r}
+
+a <- length(proj1[proj1@cellColData$Sex_celltype == "F_UBC_GNP_progenitors"]$cellNames)
+b <- length(proj1[proj1@cellColData$Sex_celltype == "M_UBC_GNP_progenitors"]$cellNames)
+c <- min(a, b)
+pdf(file.path(workDir, 'figures',"TF_Barhl1_expr_activity_heatmap.pdf"), width = 8, height = 5)
+plot_gene_cell_expr_activity(
+  df = results_RLsvz,
+  cur_TF = 'Barhl1_457',
+  proj = proj1,
+  activity_mat = activity_mat,
+  expr_mat = expr_mat_log1p,
+  groupby = "Sex_celltypeBroad",
+  group1 = "F_UBC_GNP_progenitors"  ,
+  group2 = "M_UBC_GNP_progenitors"  ,
+  n_cells_each =min(a, b),
+   scale_mode ='zscore',
+  max_genes = 30,
+  title_prefix = "RLsvz TF targets: ",
+  clip = 1
+)
+dev.off()
+
+pdf(file.path(workDir, 'figures',"TF_Otx2_expr_activity_heatmap.pdf"), width = 8, height = 5)
+plot_gene_cell_expr_activity(
+  df = results_RLsvz,
+  cur_TF = 'Otx2_437',
+  proj = proj1,
+  activity_mat = activity_mat,
+  expr_mat = expr_mat_log1p,
+  groupby = "Sex_celltypeBroad",
+  group1 = "F_UBC_GNP_progenitors"  ,
+  group2 = "M_UBC_GNP_progenitors"  ,
+  n_cells_each =min(a, b),
+   scale_mode ='zscore',
+  max_genes = 30,
+  title_prefix = "RLsvz TF targets: ",
+  clip = 1
+)
+dev.off()
+
+pdf(file.path(workDir, 'figures',"TF_Lmx1a_expr_activity_heatmap.pdf"), width = 8, height = 5)
+plot_gene_cell_expr_activity(
+  df = results_RLsvz,
+  cur_TF = 'Lmx1a_456',
+  proj = proj1,
+  activity_mat = activity_mat,
+  expr_mat = expr_mat_log1p,
+  groupby = "Sex_celltypeBroad",
+  group1 = "F_UBC_GNP_progenitors"  ,
+  group2 = "M_UBC_GNP_progenitors"  ,
+  n_cells_each =min(a, b),
+   scale_mode ='zscore',
+  max_genes = 30,
+  title_prefix = "RLsvz TF targets: ",
+  clip = 1
+)
+dev.off()
+```
+
+
+```{r}
+library(dplyr)
+library(ggVennDiagram)
+
+padj_cutoff = 0.05
+TF_ids <- c("Lmx1a_456", 'Otx2_437', 'Barhl1_457')  # replace with your 3 IDs
+
+TGs_upM <- list(
+LMX1A = results_RLsvz %>%
+    filter(
+      TF == TF_ids[1],
+      activity_padj < padj_cutoff,
+      activity_diff > 0,
+      # expr_padj < padj_cutoff,
+      expr_log2fc > 0
+    ) %>%
+  arrange(desc(activity_diff)) %>%
+   # slice_head(n = 200) %>%
+    pull(gene) %>%
+    unique(),
+
+OTX2 = results_RLsvz %>%
+    filter(
+      TF == TF_ids[2],
+      activity_padj < padj_cutoff,
+      activity_diff > 0,
+      # expr_padj < padj_cutoff,
+      expr_log2fc > 0
+    ) %>%
+    arrange(desc(activity_diff)) %>%
+  # slice_head(n = 200) %>%
+    pull(gene) %>%
+    unique(),
+
+BARHL1  = results_RLsvz %>%
+    filter(
+      TF == TF_ids[3],
+      activity_padj < padj_cutoff,
+      activity_diff > 0,
+      # expr_padj < padj_cutoff,
+      expr_log2fc > 0
+    ) %>%
+    arrange(desc(activity_diff)) %>%
+   # slice_head(n = 200) %>%
+    pull(gene) %>%
+    unique()
+)
+
+# check sizes
+sapply(TGs_upM , length)
+
+library(VennDiagram)
+library(grid)
+
+# your list of gene sets (must be length 3)
+stopifnot(length(TGs_upM) == 3)
+set_sizes <- sapply(TGs_upM, length)
+pdf(file.path(workDir, 'figures',"Lmx1a_TGs_upM_venn.pdf"), width = 6, height = 6)
+
+grid.newpage()
+grid.draw(
+  venn.diagram(
+    x = TGs_upM,
+    filename = NULL,
+    scaled = TRUE,
+    fill = c("#89C75F", "#F37B7D", "#FEE500"),
+    alpha = 0.5,
+    cat.cex = 1.2,
+    category.names = paste0(
+      names(TGs_upM), "\n(n=", set_sizes, ")"
+    )
+  )
+)
+
+dev.off()
+
+
+library(eulerr)
+
+pdf(file.path(workDir, 'figures',"TGs_upM_venn.pdf"), width = 6, height = 6)
+
+fit <- euler(TGs_upM)
+plot(
+  fit,
+  fills = c("#89C75F", "#F37B7D", "#FEE500"),
+  alpha = 0.5,
+  quantities = TRUE
+)
+
+dev.off()
+
+```
+### --- ORA
+```{r}
+# install.packages("enrichR")
+library(enrichR)
+library(dplyr)
+library(readr)
+
+
+cur_TF <- "Barhl1_457" # "Lmx1a_456"  "Otx2_437"   "Barhl1_457" "Gbx1_571"  
+cur_df <- results_RLsvz %>% subset(activity_padj < 0.05 & activity_diff > 0 &  expr_log2fc > 0 & TF == cur_TF )
+
+
+genes <- unique(cur_df$gene)
+length(genes)
+
+
+dbs <- listEnrichrDbs()
+dbs %>% arrange(desc(libraryName))
+dbs_use <- c(
+  "GO_Biological_Process_2025",
+  # "KEGG_2019_Mouse",
+  "MSigDB_Hallmark_2020",
+  "WikiPathways_2019_Mouse"
+)
+
+# ---------------------------
+# 3) Run Enrichr ORA
+# ---------------------------
+enr <- enrichr(genes, dbs_use)
+
+# ---------- main: stack all enrichr db outputs ----------
+stack_enrichr_results <- function(enr_list) {
+  bind_rows(lapply(names(enr_list), function(db) {
+    x <- enr_list[[db]]
+    if (is.null(x) || !is.data.frame(x) || nrow(x) == 0) return(NULL)
+    x %>% mutate(DB = db, .before = 1)
+  }))
+}
+
+all_res <- stack_enrichr_results(enr) # function below
+write.csv(all_res, file.path(workDir, 'figures', paste0(cur_TF, "_targetGenes_upM_GSEA_enrichR.csv")))
+file.path(workDir, 'figures', paste0(cur_TF, "_targetGenes_upM_GSEA_enrichR.csv"))
+```
+### --- collapse enrichR output
+```{r}
+library(dplyr)
+library(stringr)
+library(tibble)
+
+collapse_by_overlap_global <- function(df,
+                                      genes_col   = "Genes",
+                                      term_col    = "Term",
+                                      padj_col    = "Adjusted.P.value",
+                                      odds_col    = "Odds.Ratio",
+                                      prefer_col  = "Adjusted.P.value",
+                                      jaccard_max = 0.4,
+                                      min_genes   = 2,
+                                      keep_terms  = NULL,
+                                      filter_terms = NULL) {
+  # deps: dplyr, stringr
+  parse_gene_set <- function(x) {
+    if (is.na(x) || !nzchar(x)) return(character(0))
+    strsplit(x, ";", fixed = TRUE)[[1]] |> trimws() |> (\(v) v[v != ""])()
+  }
+  jaccard <- function(a, b) {
+    if (!length(a) || !length(b)) return(0)
+    length(intersect(a, b)) / length(union(a, b))
+  }
+
+  keep_terms2   <- if (is.null(keep_terms)) character(0) else keep_terms
+  filter_terms2 <- if (is.null(filter_terms)) character(0) else filter_terms
+  larger_is_better <- identical(prefer_col, odds_col)
+
+  stopifnot(all(c(genes_col, term_col, padj_col, odds_col, prefer_col) %in% colnames(df)))
+
+  df2 <- df |>
+    dplyr::filter(!( .data[[term_col]] %in% filter_terms2 )) |>
+    dplyr::mutate(
+      .genes = lapply(as.character(.data[[genes_col]]), parse_gene_set),
+      .ng = vapply(.genes, length, integer(1)),
+      .force_keep = (.data[[term_col]] %in% keep_terms2)
+    ) |>
+    dplyr::filter(.ng >= min_genes) |>
+    dplyr::arrange(dplyr::desc(.force_keep), .data[[padj_col]], dplyr::desc(.ng))
+
+  df2$.force_keep[is.na(df2$.force_keep)] <- FALSE
+
+  better <- function(i_new, i_old) {
+    a <- df2[[prefer_col]][i_new]
+    b <- df2[[prefer_col]][i_old]
+    if (is.na(a)) a <- if (larger_is_better) -Inf else Inf
+    if (is.na(b)) b <- if (larger_is_better) -Inf else Inf
+    if (a != b) return(if (larger_is_better) a > b else a < b)
+
+    pn <- df2[[padj_col]][i_new]
+    po <- df2[[padj_col]][i_old]
+    if (!is.na(pn) && !is.na(po) && pn != po) return(pn < po)
+
+    df2$.ng[i_new] > df2$.ng[i_old]
+  }
+
+  kept_idx <- integer(0)
+  kept_sets <- list()
+
+  for (i in seq_len(nrow(df2))) {
+    gi <- df2$.genes[[i]]
+
+    if (isTRUE(df2$.force_keep[i]) || length(kept_idx) == 0) {
+      kept_idx <- c(kept_idx, i)
+      kept_sets[[length(kept_sets) + 1]] <- gi
+      next
+    }
+
+    overlaps <- vapply(kept_sets, function(gk) jaccard(gi, gk), numeric(1))
+    hit <- which(overlaps > jaccard_max)
+
+    if (!length(hit)) {
+      kept_idx <- c(kept_idx, i)
+      kept_sets[[length(kept_sets) + 1]] <- gi
+    } else {
+      j <- hit[which.max(overlaps[hit])]
+      if (better(i, kept_idx[j])) {
+        kept_idx[j] <- i
+        kept_sets[[j]] <- gi
+      }
+    }
+  }
+
+  df2[kept_idx, , drop = FALSE] |>
+    dplyr::select(-.genes, -.ng, -.force_keep)
+}
+
+
+
+
+```
+
+```{r}
+
+
+term_to_exclude <- all_res$Term[grepl("Cancer|UV|Adhesion|Apo|Ossi|Dea|Estro|Nucleophile|Pluri",all_res$Term)]
+
+
+all_res_sig <- all_res %>% filter(Adjusted.P.value <= 0.05)
+
+all_res %>% subset(grepl("Mitotic", Term))
+
+collapsed <- collapse_by_overlap_global(
+  all_res_sig,
+  prefer_col = "Adjusted.P.value",
+  jaccard_max = 0.5,  # tune this
+  min_genes = 3,
+  keep_terms  = c("Mitotic Spindle Organization"),
+  filter_terms = term_to_exclude
+  
+  
+)
+
+collapsed <- collapsed %>%
+  mutate(
+    Term_shorten = Term %>%
+      str_remove("\\s*\\(GO:\\d+\\)") %>%   # remove (GO:xxxxxxx)
+      str_remove("\\s*\\(?WP\\d+\\)?") %>%  # remove WPxxxx or (WPxxxx)
+      str_squish()
+  )  %>%
+    arrange(Adjusted.P.value) %>%
+    slice_head(n = 10) %>%
+    mutate(
+      Term = factor(Term_shorten, levels = rev(Term_shorten)),
+      neglog10FDR = -log10(Adjusted.P.value)
+    )
+collapsed <- collapsed %>% distinct(tolower(Term), .keep_all = TRUE) %>% 
+  subset(!Term %in% c("mRNA Cis Splicing, via Spliceosome",
+                      "Negative Regulation of Transcription by RNA Polymerase II", "Negative Regulation of DNA-templated Transcription", "Positive Regulation of DNA-templated Transcription"))
+tf_name <- unlist(strsplit(cur_TF, split= "_", fixed = T))[1]
+color_dict <- c('Lmx1a' = "#89C75F", 'Otx2' = "#F37B7D", "Barhl1"="#FEE500")
+p1 <- ggplot(collapsed, aes(x = neglog10FDR, y = Term)) +
+    geom_col(color = 'lightblue', fill = color_dict[tf_name]) +
+    labs(x = "-log10(FDR)", y = NULL, title = ) +
+    theme_classic()+
+  theme(axis.text = element_text(size = 12, color = 'black'), axis.title  = element_text(size = 12, color = 'black'))
+p1 
+
+ggsave(file.path(workDir, 'figures', paste0(cur_TF, "_targetGenes_GSEA_barplots.pdf")), p1, width=10, height=5)
+```
+
+### --- check motif footprint in motifs close to MvsF diff open genes
+```{r}
+cur_motif <- "Lmx1a_456" #"Lmx1a_456"  "Otx2_437"   "Barhl1_457"
+
+# 1. Get significantly different genes from your results
+sig_genes <- results_RLsvz %>% subset(TF == cur_motif) %>%
+  subset(activity_padj < 0.05 & activity_diff > 0) %>%
+  pull(gene)
+
+# 2. Get gene coordinates
+gene_anno <- getGeneAnnotation(proj1)
+sig_gene_gr <- gene_anno$genes[gene_anno$genes$symbol %in% sig_genes]
+
+# 3. Filter motif positions - only keep motifs near significant genes
+motif_gr_full <- motifPositions[[cur_motif]]
+
+# Find motifs overlapping or near significant genes (e.g., within 5kb)
+overlaps <- findOverlaps(
+  motif_gr_full, 
+  resize(sig_gene_gr, width(sig_gene_gr) + 3000, fix = "center"),
+  ignore.strand = TRUE
+)
+
+motif_gr_filtered <- motif_gr_full[queryHits(overlaps)]
+motif_list <- GRangesList("motif" = motif_gr_filtered)
+
+library(BSgenome)
+seFoot_filtered <- getFootprints(
+  ArchRProj = proj1,
+  positions = motif_list,
+  groupBy = "Sex_celltypeBroad",
+ useGroups = c("F_UBC_GNP_progenitors","M_UBC_GNP_progenitors", "F_UBC","M_UBC" ),
+)
+
+# 5. Plot
+plotFootprints(
+  seFoot = seFoot_filtered,
+  ArchRProj = proj1,
+  normMethod = "Subtract",
+  plotName = "Footprints-Lmx1a-SigGenes",
+  addDOC = FALSE,
+  smoothWindow = 10,
+  pal = c("F_UBC_GNP_progenitors" = "salmon","M_UBC_GNP_progenitors"="turquoise", "F_UBC" ="maroon","M_UBC"='darkblue')
+)
+
+
+
+```
+
+
+# Save UMAP embedding
+```{r}
+wnnumapcoord <- read.csv(file.path(outpath, 'RDS', 'UBCEnrichedE16Multiome_SignacObject_GlutaCellsOnly_wnn.umap.coord.csv'), row.names = 1)
+
+# Convert to matrix
+wnnumapcoord_mat <- as.matrix(wnnumapcoord)
+
+# Get all cells in proj1
+proj1_cells <- rownames(proj1@cellColData)
+
+# Create full embedding matrix with NAs
+full_embedding <- matrix(NA, nrow = length(proj1_cells), ncol = 2)
+rownames(full_embedding) <- proj1_cells
+
+# Fill in cells that have embeddings
+common_cells <- intersect(rownames(wnnumapcoord_mat), proj1_cells)
+full_embedding[common_cells, ] <- wnnumapcoord_mat[common_cells, ]
+
+cat("Total cells in proj1:", length(proj1_cells), "\n")
+cat("Cells with embeddings:", length(common_cells), "\n")
+cat("Missing embeddings:", sum(is.na(full_embedding[,1])), "\n")
+
+# Convert to dataframe with proper column names
+embedding_df <- as.data.frame(full_embedding)
+colnames(embedding_df) <- paste0("UMAP_WnnUMAP_GlutaOnly#", c("UMAP_Dimension_1", "UMAP_Dimension_2"))
+
+# Add to ArchR
+proj1@embeddings$UMAP_WnnUMAP_GlutaOnly <- SimpleList(
+    df = embedding_df,
+    params = proj1@embeddings$UMAP_ATAC$params
+)
+
+# Plot
+p <- plotEmbedding(
+    ArchRProj = proj1, 
+    colorBy = "MotifMatrix", 
+    name = "z:Myog_45", 
+    embedding = "UMAP_WnnUMAP_GlutaOnly",
+    plotAs = "points"
+) +facet_wrap(~proj1$rna_Sex) 
+  
+p
+
+# saveArchRProject(ArchRProj = proj1, outputDirectory =outpath, load = FALSE)
+
+```
+
+### -- visalize in glutacell only umap
+```{r}
+
+motif_counts <- readRDS("chromvar_z.rds")
+motif_dev <- saveRDS( "chromvar_deviations.rds")
+motif_ranges <- saveRDS("chromvar_motifs.rds")
+
+
+write.csv(as.data.frame(motif_counts), file.path(outpath, 'exportMM/chromVar', 'UBCEnrichedE16Multiome_chromVarMatrix.csv'))
+
+# glutaOnly_obj <- readRDS(file.path(outpath, 'RDS', 'UBCEnrichedE16Multiome_SignacObject_GlutaCellsOnly.RDS'))
+# wnnumapcoord <- as.data.frame(glutaOnly_obj@reductions$wnn.umap@cell.embeddings)
+# write.csv(wnnumapcoord, file.path(outpath, 'RDS', 'UBCEnrichedE16Multiome_SignacObject_GlutaCellsOnly_wnn.umap.coord.csv'))
+
+wnnumapcoord <- read.csv(file.path(outpath, 'RDS', 'UBCEnrichedE16Multiome_SignacObject_GlutaCellsOnly_wnn.umap.coord.csv'), row.names = 1)
+
+# visualize in python scanpy object instead
+
+```
+
+# export peak matrix
+```{r}
+
+# write.csv(proj1@cellColData, file.path(outpath,'tables','cellMetadata.csv'), row.names = T)
+
+
+# TileMatrix rownames
+matrixData <- getMatrixFromProject(proj1, useMatrix = "PeakMatrix" , binarize = F)
+head(matrixData[1:5,1:5])
+
+peakRanges_df <- matrixData@assays@data$PeakMatrix
+
+class(peakRanges_df)
+
+
+# # Save the sparse matrix to a file
+# writeMM(peakRanges_df, file = file.path(outpath, 'exportMM', 'PeakMatrix',"matrix.mtx")) # binarized
+writeMM(peakRanges_df, file = file.path(outpath, 'exportMM', 'PeakMatrixNB',"matrix.mtx"))
+
+# # Export cellnames
+# writeLines(colnames(peakRanges_df), file.path(outpath, 'exportMM', 'PeakMatrix', "cell_names.txt"))
+writeLines(colnames(peakRanges_df), file.path(outpath, 'exportMM', 'PeakMatrixNB', "cell_names.txt"))
+
+# Export region names
+row_ranges <- rowRanges(matrixData)
+region_names <- paste0(seqnames(row_ranges), ":", start(row_ranges), "-", end(row_ranges))
+# writeLines(region_names, file.path(outpath, 'exportMM', 'PeakMatrix', "region_names.txt"))
+writeLines(region_names, file.path(outpath, 'exportMM', 'PeakMatrixNB', "region_names.txt"))
+
+
+# write.csv(as.data.frame(matrixData@colData), file.path(outpath, 'exportMM', 'PeakMatrix','cell_metadata.csv'), row.names = T, col.names = T)
+write.csv(as.data.frame(matrixData@colData), file.path(outpath, 'exportMM', 'PeakMatrixNB','cell_metadata.csv'), row.names = T, col.names = T)
+```
+
+#### --- extract info under seurat4 env
+```{r}
+workDir <- "/research/groups/northcgrp/home/common/Rachel/sex_bias"
+inpath <- file.path(workDir, "scripts/UBCenrichedE16Multiome/snATAC_mutiome") # dir with original arrow files
+outpath <- file.path(workDir, "processed/mouse/multiome/snATAC/UBCenrichedE16Multiome_RNAATACshared")
+
+```
+
+```{r}
+
+
+# library(ArchR)
+# library(Seurat)
+# 
+# 
+# rna_obj_shared <- readRDS("/research/groups/northcgrp/home/common/Rachel/sex_bias/processed/mouse/multiome/writes/UBCenrichedE16Multiome_ATACshared_seurat.RDS")
+# 
+# # 1. Export ATAC data from ArchR
+# peak_matrix <- getMatrixFromProject(proj1, useMatrix = "PeakMatrix")
+# peak_counts <- assay(peak_matrix)
+# peak_ranges <- rowRanges(peak_matrix)
+# 
+# # Save ATAC data
+# saveRDS(peak_counts, "peak_counts.rds")
+# saveRDS(peak_ranges, "peak_ranges.rds")
+
+# # 1.2. Export ChromVar data from ArchR
+# motif_matrix <- getMatrixFromProject(proj1, useMatrix = "MotifMatrix")
+# motif_counts <- assay(motif_matrix, "z")
+# motif_dev <- assay(motif_matrix, "deviations")
+# motif_ranges <- rownames(motif_matrix)
+# 
+# # Save chromvar data
+# saveRDS(motif_counts, "chromvar_z.rds")
+# saveRDS(motif_dev, "chromvar_deviations.rds")
+# saveRDS(motif_ranges, "chromvar_motifs.rds")
+
+# # 1.3. Export TileMatrix data from ArchR
+# tile_matrix <- getMatrixFromProject(proj1, useMatrix = "TileMatrix", binarize = T)
+# tile_count <- assay(motif_matrix)
+# tile_ranges <- rowRanges(motif_matrix)
+# 
+# # Save chromvar data
+# saveRDS(tile_counts, "TileMatrix.rds")
+# saveRDS(tile_ranges, "TileMatrix_ranges.rds")
+
+# 
+# # 2. Export LSI from ArchR
+# lsi_matrix <- getReducedDims(proj1, reducedDims = "IterativeLSI")
+# saveRDS(lsi_matrix, "lsi_embeddings.rds")
+# 
+# # 3. Export ATAC UMAP
+# umap_atac <- getEmbedding(proj1, embedding = "UMAP_ATAC")
+# saveRDS(umap_atac, "umap_atac.rds")
+# 
+# # 4. Export metadata
+# metadata <- as.data.frame(getCellColData(proj1))
+# saveRDS(metadata, "metadata.rds")
+# 
+# # 5. Export RNA counts from Seurat v4 object
+# rna_counts <- rna_obj_shared@assays$RNA$counts
+# saveRDS(rna_counts, "rna_counts.rds")
+# 
+# # 6. Export RNA embeddings if available
+# if ("pca" %in% Seurat::Reductions(rna_obj_shared)) {
+#     pca_embeddings <- Seurat::Embeddings(rna_obj_shared, reduction = "pca")
+#     saveRDS(pca_embeddings, "pca_embeddings.rds")
+# }
+# 
+# if ("umap" %in% Seurat::Reductions(rna_obj_shared)) {
+#     umap_rna <- Seurat::Embeddings(rna_obj_shared, reduction = "umap")
+#     saveRDS(umap_rna, "umap_rna.rds")
+# }
+# 
+# # If you have scVI
+# if ("scVI" %in% Seurat::Reductions(rna_obj_shared)) {
+#     scvi_embeddings <- Seurat::Embeddings(rna_obj_shared, reduction = "scVI")
+#     saveRDS(scvi_embeddings, "scvi_embeddings.rds")
+# }
+
+```
+#### --- save signac object under seurat5 env
+```{r}
+workDir <- "/research/groups/northcgrp/home/common/Rachel/sex_bias"
+inpath <- file.path(workDir, "scripts/UBCenrichedE16Multiome/snATAC_mutiome") # dir with original arrow files
+outpath <- file.path(workDir, "processed/mouse/multiome/snATAC/UBCenrichedE16Multiome_RNAATACshared")
+
+```
+
+```{r}
+
+library(Seurat)
+library(Signac)
+library(GenomicRanges)
+
+# 1. Load all exported data
+peak_counts <- readRDS("peak_counts.rds")
+peak_ranges <- readRDS("peak_ranges.rds")
+
+chromvar_motifs_mean <- readRDS("chromvar_z.rds")
+chromvar_motifs_dev <- readRDS("chromvar_deviations.rds")
+chromvar_motifs_ranges <- readRDS("chromvar_motifs.rds")
+
+# tile_counts <- readRDS("TileMatrix.rds")
+# tile_ranges <- readRDS("TileMatrix_ranges.rds")
+
+lsi_matrix <- readRDS("lsi_embeddings.rds")
+umap_atac <- readRDS("umap_atac.rds")
+metadata <- readRDS("metadata.rds")
+rna_counts <- readRDS("rna_counts.rds")
+colnames(rna_counts) <- rownames(metadata)
+
+rna_obj_shared <- readRDS("/research/groups/northcgrp/home/common/Rachel/sex_bias/processed/mouse/multiome/writes/UBCenrichedE16Multiome_ATACshared_seurat.RDS")
+rna_sp <- rna_obj_shared@assays$RNA$data
+colnames(rna_sp) <- rna_obj_shared@meta.data$atac_cellid
+expr_mat_log1p <- SummarizedExperiment::SummarizedExperiment(
+  assays  = SimpleList(data = rna_sp),
+  rowData = DataFrame(name = rownames(rna_sp)),
+  colData = DataFrame(cellNames = colnames(rna_sp))
+)
+
+# Optional embeddings
+pca_embeddings <- readRDS("pca_embeddings.rds")
+scvi_embeddings <- readRDS("scvi_embeddings.rds")
+umap_rna <- readRDS("umap_rna.rds")
+
+# 2. Create Seurat object with RNA
+seurat_obj <- CreateSeuratObject(
+    counts = rna_counts,
+    assay = "RNA",
+    meta.data = metadata
+)
+
+seurat_obj@assays$RNA$data <- rna_sp
+
+# 3. Add ATAC assay
+seurat_obj[["ATAC"]] <- CreateChromatinAssay(
+    counts = peak_counts,
+    ranges = peak_ranges,
+    genome = "mm39"
+)
+
+
+# 3. Add chromvar assay
+seurat_obj[["chromvar"]] <- CreateAssayObject(counts = chromvar_motifs_mean)
+
+# 4. Add pre-computed embeddings
+seurat_obj[["LSI"]] <- CreateDimReducObject(
+    embeddings = lsi_matrix,
+    key = "LSI_",
+    assay = "ATAC"
+)
+
+seurat_obj[["umap_atac"]] <- CreateDimReducObject(
+    embeddings = as.matrix(umap_atac),
+    key = "UMAPATAC_",
+    assay = "ATAC"
+)
+
+rownames(pca_embeddings) <- rownames(metadata)
+if (exists("pca_embeddings")) {
+    seurat_obj[["pca"]] <- CreateDimReducObject(
+        embeddings = pca_embeddings,
+        key = "PC_",
+        assay = "RNA"
+    )
+}
+
+rownames(scvi_embeddings) <- rownames(metadata)
+if (exists("scvi_embeddings")) {
+    seurat_obj[["scvi"]] <- CreateDimReducObject(
+        embeddings = scvi_embeddings,
+        key = "scVI_",
+        assay = "RNA"
+    )
+}
+
+# 5. Run multimodal analysis
+
+# Choose which RNA reduction to use
+rna_reduction <- "scvi"
+seurat_obj <- FindMultiModalNeighbors(
+    seurat_obj,
+    reduction.list = list(rna_reduction, "LSI"),
+    dims.list = list(1:50, 2:30)
+)
+
+seurat_obj <- RunUMAP(
+    seurat_obj,
+    nn.name = "weighted.nn",
+    reduction.name = "wnn.umap",
+    reduction.key = "wnnUMAP_", min_dist=0.1, spread=2
+)
+
+# 6. Visualize
+DimPlot(seurat_obj, reduction = "wnn.umap", group.by = "rna_Sex")
+FeaturePlot(seurat_obj, reduction = "wnn.umap",features  = "Lmx1a")
+
+saveRDS(seurat_obj, file.path(outpath, 'RDS', 'UBCEnrichedE16Multiome_SignacObject.RDS'))
+
+```
+### --- RNA+ATAC UMAP for cell of interest only
+```{r}
+
+seurat_obj <- readRDS( file.path(outpath, 'RDS', 'UBCEnrichedE16Multiome_SignacObject.RDS'))
+
+# Subset cells
+cells_to_keep <- rownames(seurat_obj@meta.data)[
+    grepl("^RL|^UBC|^GN", seurat_obj@meta.data$rna_human_celltype_pred_broad)
+]
+unique(seurat_obj@meta.data$rna_human_celltype_pred_broad[grepl("^RL|^UBC|^GN", seurat_obj@meta.data$rna_human_celltype_pred_broad)])
+
+
+
+# # Rerun multimodal neighbors
+# seurat_obj_subset <- FindMultiModalNeighbors(
+#     seurat_obj_subset,
+#     k.nn = 50,
+#     reduction.list = list('scvi', "LSI"),
+#     dims.list = list(1:50, 2:30)
+# )
+# 
+# # Rerun UMAP
+# seurat_obj_subset <- RunUMAP(
+#     seurat_obj_subset,
+#     nn.name = "weighted.nn",
+#     reduction.name = "wnn.umap",
+#     reduction.key = "wnnUMAP_", min_dist=0.1, spread=2
+# )
+
+
+seurat_obj_subset <- readRDS( file.path(outpath, 'RDS', 'UBCEnrichedE16Multiome_SignacObject_GlutaCellsOnly.RDS'))
+seurat_obj_subset
+umap_coords <- seurat_obj_subset@reductions$wnn.umap
+
+seurat_obj_subset <- subset(seurat_obj, cells = cells_to_keep)
+
+seurat_obj_subset@reductions$wnn.umap <- umap_coords
+
+seurat_obj_subset
+
+# Visualize
+
+FeaturePlot(seurat_obj_subset, reduction = "wnn.umap", features = c('Lmx1a', 'Eomes', 'Mki67'))
+
+seurat_obj_subset@meta.data$celltype <- ifelse(seurat_obj_subset@meta.data$rna_human_celltype_pred_broad == 'GNP', 'UBC_GNP_progenitors', as.character(seurat_obj_subset@meta.data$rna_human_celltype_pred_broad))
+DimPlot(seurat_obj_subset, reduction = "wnn.umap", group.by = c("celltype"))
+
+DefaultAssay(seurat_obj_subset) <- 'chromvar'
+motif_names <- rownames(seurat_obj_subset@assays$chromvar$counts)
+cur_motif <- motif_names[grepl('Lmx1a', motif_names)]
+FeaturePlot(seurat_obj_subset, reduction = "wnn.umap", features =cur_motif, split.by = 'rna_Sex')
+
+DefaultAssay(seurat_obj_subset) <- 'chromvar'
+
+saveRDS(seurat_obj_subset, file.path(outpath, 'RDS', 'UBCEnrichedE16Multiome_SignacObject_GlutaCellsOnly.RDS'))
+```
+
+```{r}
+
+workDir <- file.path(Sys.getenv("COMMONR"),"sex_bias")
+inpath <- file.path(workDir, "scripts/UBCenrichedE16Multiome/snATAC_mutiome") # dir with original arrow files
+outpath <- file.path(workDir, "processed/mouse/multiome/snATAC/UBCenrichedE16Multiome_RNAATACshared")
+
+
+seurat_obj_subset <- readRDS( file.path(outpath, 'RDS', 'UBCEnrichedE16Multiome_SignacObject_GlutaCellsOnly.RDS'))
+seurat_obj_subset
+```
+
+```{r}
+library(Seurat)
+library(Signac)
+library(GenomicRanges)
+
+# 1. Load all exported data
+peak_counts <- readRDS("peak_counts.rds")
+peak_ranges <- readRDS("peak_ranges.rds")
+lsi_matrix <- readRDS("lsi_embeddings.rds")
+umap_atac <- readRDS("umap_atac.rds")
+metadata <- readRDS("metadata.rds")
+rna_counts <- readRDS("rna_counts.rds")
+
+# embeddings
+pca_embeddings <- readRDS("pca_embeddings.rds")
+scvi_embeddings <- readRDS("scvi_embeddings.rds")
+umap_rna <- readRDS("umap_rna.rds")
+
+# 2. Create Seurat object with RNA
+seurat_obj <- CreateSeuratObject(
+    counts = rna_counts,
+    assay = "RNA",
+    meta.data = metadata
+)
+
+# 3. Add ATAC assay
+seurat_obj[["ATAC"]] <- CreateChromatinAssay(
+    counts = peak_counts,
+    ranges = peak_ranges,
+    genome = "mm39"
+)
+
+# 4. Add pre-computed embeddings
+seurat_obj[["LSI"]] <- CreateDimReducObject(
+    embeddings = lsi_matrix,
+    key = "LSI_",
+    assay = "ATAC"
+)
+
+seurat_obj[["umap_atac"]] <- CreateDimReducObject(
+    embeddings = umap_atac,
+    key = "UMAPATAC_",
+    assay = "ATAC"
+)
+
+if (exists("pca_embeddings")) {
+    seurat_obj[["pca"]] <- CreateDimReducObject(
+        embeddings = pca_embeddings,
+        key = "PC_",
+        assay = "RNA"
+    )
+}
+
+if (exists("scvi_embeddings")) {
+    seurat_obj[["scvi"]] <- CreateDimReducObject(
+        embeddings = scvi_embeddings,
+        key = "scVI_",
+        assay = "RNA"
+    )
+}
+
+# 5. Run multimodal analysis
+# If you have scVI, use it; otherwise compute PCA
+if (!"pca" %in% Reductions(seurat_obj)) {
+    DefaultAssay(seurat_obj) <- "RNA"
+    seurat_obj <- NormalizeData(seurat_obj)
+    seurat_obj <- FindVariableFeatures(seurat_obj)
+    seurat_obj <- ScaleData(seurat_obj)
+    seurat_obj <- RunPCA(seurat_obj)
+}
+
+# Choose which RNA reduction to use
+rna_reduction <- if ("scvi" %in% Reductions(seurat_obj)) "scvi" else "pca"
+
+seurat_obj <- FindMultiModalNeighbors(
+    seurat_obj,
+    reduction.list = list(rna_reduction, "LSI"),
+    dims.list = list(1:30, 2:30)
+)
+
+seurat_obj <- RunUMAP(
+    seurat_obj,
+    nn.name = "weighted.nn",
+    reduction.name = "wnn.umap",
+    reduction.key = "wnnUMAP_"
+)
+
+# 6. Visualize
+DimPlot(seurat_obj, reduction = "wnn.umap", group.by = "Sex")
+
+# 7. Save final object
+saveRDS(seurat_obj, "signac_multimodal_object.rds")
+
+
+
+```
+
+
